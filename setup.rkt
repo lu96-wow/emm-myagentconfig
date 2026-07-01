@@ -59,8 +59,8 @@
       (printf "==> 添加 pi alias 到 .bashrc\n")
       (call-with-output-file bashrc
         (lambda (out)
-          (fprintf out "~a\n\n# pi aliases\nalias pi='pi'\nalias pi-doc='pi --append-system-prompt \"$(cat ~/.pi/agent/PI_DOCS.md)\"'\n"
-                   (file->string bashrc)))
+          (display (file->string bashrc) out)
+          (display "\n\n# pi aliases\nalias pi='pi'\nalias pi-doc='pi --append-system-prompt \"$(cat ~/.pi/agent/PI_DOCS.md)\"'\n" out))
         #:exists 'replace)
       (printf "    ✓ 已添加，执行 source ~/.bashrc 生效\n")))
 
