@@ -531,12 +531,9 @@ export default function (pi: ExtensionAPI) {
 		const sshNote = [
 			"",
 			"## SSH Remote Connection",
-			`You are connected to remote host: ${sshConfig.remote}`,
-			`Remote working directory: ${sshConfig.remoteCwd}`,
-			"",
-			"**Remote tools available:** ssh_bash, ssh_read, ssh_write, ssh_edit",
-			"**Local tools remain available for local operations:** bash, read, write, edit",
-			"Use ssh_* tools for remote operations and regular tools for local operations.",
+			`Connected to ${sshConfig.remote}, working directory ${sshConfig.remoteCwd}.`,
+			"Remote tools: ssh_bash, ssh_read, ssh_write, ssh_edit.",
+			"Local tools (bash, read, write, edit) remain available for local operations.",
 		].join("\n");
 
 		return { systemPrompt: event.systemPrompt + sshNote };
