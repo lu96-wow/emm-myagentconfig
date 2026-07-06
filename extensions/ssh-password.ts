@@ -223,7 +223,7 @@ function createRemoteWriteOps(): WriteOperations {
 	return {
 		writeFile: async (p: string, content: Buffer) => {
 			const remote = toRemotePath(p);
-			const b64 = content.toString("base64");
+			const b64 = Buffer.from(content).toString("base64");
 			await sshExec(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(remote)}`);
 		},
 		mkdir: (dir: string) => {
