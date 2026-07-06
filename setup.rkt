@@ -26,9 +26,10 @@
 ;; ── 安装扩展 ────────────────────────────────────────────
 (let ([ext-dir (build-path target-dir "extensions")])
   (make-directory* ext-dir)
-  (copy-file (build-path src-dir "extensions" "bracket-check.ts")
-             (build-path ext-dir "bracket-check.ts") #t)
-  (printf "    ✓ extensions/bracket-check.ts\n"))
+  (for ([ext '("bracket-check.ts" "ssh-password.ts")])
+    (copy-file (build-path src-dir "extensions" ext)
+               (build-path ext-dir ext) #t)
+    (printf "    ✓ extensions/~a\n" ext)))
 
 ;; ── 交互式设置 API Key ──────────────────────────────────
 (define auth-file (build-path target-dir "auth.json"))
