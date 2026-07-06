@@ -242,11 +242,11 @@ function formatOutput(
   topLevelForms: TopLevelForm[]
 ): string {
   if (issues.length === 0) {
-    return `✅ 括号检查通过 — ${filePath} 中所有括号配对平衡`;
+    return `括号检查通过 — ${filePath} 中所有括号配对平衡`;
   }
 
   const parts: string[] = [];
-  parts.push(`❌ 发现 ${issues.length} 个括号问题:\n`);
+  parts.push(`发现 ${issues.length} 个括号问题:\n`);
 
   for (let idx = 0; idx < issues.length; idx++) {
     const issue = issues[idx];
@@ -306,7 +306,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `❌ 文件不存在: ${filePath}`,
+              text: ` 文件不存在: ${filePath}`,
             },
           ],
           details: { error: "file not found", path: filePath },
@@ -326,7 +326,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `❌ 无法读取文件: ${err.message}`,
+              text: ` 无法读取文件: ${err.message}`,
             },
           ],
           details: { error: "read error", message: err.message },
