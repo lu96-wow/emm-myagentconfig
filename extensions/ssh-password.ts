@@ -61,40 +61,86 @@ function checkSshpass(): string | null {
 
 function toRemotePath(localPath: string): string {
 	if (!sshConfig) return localPath;
-	return localPath.replace(localCwd, sshConfig.remoteCwd);
+	// Match directory prefix only, not substring. /home/user must not match /home/user2.
+	if (localPath === localCwd) return sshConfig.remoteCwd;
+	if (localPath.startsWith(localCwd + "/")) {
+		return sshConfig.remoteCwd + localPath.slice(localCwd.length);
+	}
+	// Path outside cwd — pass through as-is (may fail on remote, which is correct)
+	return localPath;
 }
 
-function sshExec(command: string, timeout?: number): Promise<Buffer> {
+function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSignal }): Promise<Buffer> {
 	if (!sshConfig || !sshPassword) {
-		return Promise.reject(new Error("Not connected. Call ssh_connect or use /ssh first."));
+		return Promise.reject(new Error("SSH not connected. The AI should call ssh_connect first, or use /ssh in the TUI."));
 	}
 
+	const timeout = opts?.timeout;
+	const signal = opts?.signal;
+
 	return new Promise((resolve, reject) => {
+		// Guard: already aborted before we even spawn
+		if (signal?.aborted) {
+			return reject(new Error("Aborted"));
+		}
+
 		const child = spawn(
 			"sshpass",
-			["-e", "ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", sshConfig.remote, command],
-			{ stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, SSHPASS: sshPassword } },
+			["-e", "ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", sshConfig!.remote, command],
+			{ stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, SSHPASS: sshPassword! } },
 		);
 
 		const chunks: Buffer[] = [];
 		const errChunks: Buffer[] = [];
 
+		// Timeout timer
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		if (timeout) {
+		if (timeout && timeout > 0) {
 			timer = setTimeout(() => {
 				child.kill();
 				reject(new Error(`SSH command timed out after ${timeout}s`));
 			}, timeout * 1000);
 		}
 
+		// Abort listener
+		const onAbort = () => {
+			child.kill();
+			reject(new Error("Aborted"));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+
 		child.stdout.on("data", (data: Buffer) => chunks.push(data));
 		child.stderr.on("data", (data: Buffer) => errChunks.push(data));
-		child.on("error", reject);
-		child.on("close", (code) => {
+
+		child.on("error", (err) => {
 			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			const msg = (err as NodeJS.ErrnoException).code === "ENOENT"
+				? "sshpass not found. Install: sudo apt install sshpass"
+				: `SSH spawn failed: ${err.message}`;
+			reject(new Error(msg));
+		});
+
+		child.on("close", (code, exitSignal) => {
+			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+
+			if (exitSignal) {
+				return reject(new Error(`SSH process killed by signal ${exitSignal}`));
+			}
 			if (code !== 0) {
 				const errText = Buffer.concat(errChunks).toString().trim();
-				reject(new Error(`SSH failed (exit ${code}): ${errText}`));
+				// Classify common failures
+				if (errText.includes("Permission denied") || errText.includes("password")) {
+					return reject(new Error(`SSH authentication failed: ${errText}`));
+				}
+				if (errText.includes("Connection refused") || errText.includes("Connection timed out") || errText.includes("No route to host")) {
+					return reject(new Error(`SSH connection failed: ${errText}`));
+				}
+				if (errText.includes("Host key verification failed")) {
+					return reject(new Error(`SSH host key changed or unknown. Run: ssh-keygen -R ${sshConfig!.remote} and retry.`));
+				}
+				reject(new Error(`SSH command failed (exit ${code}): ${errText}`));
 			} else {
 				resolve(Buffer.concat(chunks));
 			}
@@ -113,15 +159,21 @@ function requireConnected(): SshConfig {
 
 function createRemoteReadOps(): ReadOperations {
 	return {
-		readFile: (p: string) => sshExec(`cat ${JSON.stringify(toRemotePath(p))}`),
-		access: (p: string) =>
-			sshExec(`test -r ${JSON.stringify(toRemotePath(p))}`).then(
+		readFile: (p: string) => {
+			const remote = toRemotePath(p);
+			return sshExec(`cat ${JSON.stringify(remote)}`);
+		},
+		access: (p: string) => {
+			const remote = toRemotePath(p);
+			return sshExec(`test -r ${JSON.stringify(remote)}`).then(
 				() => {},
-				() => { throw new Error(`File not readable: ${p}`); },
-			),
+				() => { throw new Error(`File not accessible on remote: ${p}`); },
+			);
+		},
 		detectImageMimeType: async (p: string) => {
 			try {
-				const r = await sshExec(`file --mime-type -b ${JSON.stringify(toRemotePath(p))}`);
+				const remote = toRemotePath(p);
+				const r = await sshExec(`file --mime-type -b ${JSON.stringify(remote)}`);
 				const m = r.toString().trim();
 				return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(m) ? m : null;
 			} catch {
@@ -134,11 +186,14 @@ function createRemoteReadOps(): ReadOperations {
 function createRemoteWriteOps(): WriteOperations {
 	return {
 		writeFile: async (p: string, content: Buffer) => {
-			const b64 = Buffer.from(content).toString("base64");
-			await sshExec(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(toRemotePath(p))}`);
+			const remote = toRemotePath(p);
+			const b64 = content.toString("base64");
+			await sshExec(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(remote)}`);
 		},
-		mkdir: (dir: string) =>
-			sshExec(`mkdir -p ${JSON.stringify(toRemotePath(dir))}`).then(() => {}),
+		mkdir: (dir: string) => {
+			const remote = toRemotePath(dir);
+			return sshExec(`mkdir -p ${JSON.stringify(remote)}`).then(() => {});
+		},
 	};
 }
 
