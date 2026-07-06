@@ -53,19 +53,46 @@
 
 ;; ── 添加 alias 到 ~/.bashrc ─────────────────────────────
 (define bashrc (build-path (find-system-path 'home-dir) ".bashrc"))
-(define marker "alias pi-doc=")
-(if (string-contains? (file->string bashrc) marker)
-    (printf "==> .bashrc 中已有 pi alias，跳过\n")
-    (begin
-      (printf "==> 添加 pi alias 到 .bashrc\n")
-      (call-with-output-file bashrc
-        (lambda (out)
-          (display (file->string bashrc) out)
-          (display "\n\n# pi aliases\nalias pi='pi'\nalias pi-doc='pi --append-system-prompt \"$(cat ~/.pi/agent/PI_DOCS.md)\"'\n" out))
-        #:exists 'replace)
-      (printf "    ✓ 已添加，执行 source ~/.bashrc 生效\n")))
+(define block-start "# >>> pi aliases (auto-generated, do not edit below) >>>")
+(define block-end   "# <<< pi aliases end <<<")
+(define ssh-exclude "--exclude-tools ssh_bash,ssh_read,ssh_write,ssh_edit,ssh_connect,ssh_disconnect")
+(define doc-cmd "\"$(cat ~/.pi/agent/PI_DOCS.md)\"")
+
+;; 先移除旧的 pi alias 块（新版和旧版 marker 都处理）
+(define old-lines (string-split (file->string bashrc) "\n"))
+(define in-block? #f)
+(define cleaned
+  (for/list ([line (in-list old-lines)])
+    (cond
+      [(string-prefix? line "# >>> pi aliases") (set! in-block? #t) #f]
+      [in-block?
+       (when (string-prefix? line "# <<< pi aliases") (set! in-block? #f))
+       #f]
+      [(or (string-prefix? line "alias pi=")       ;; 旧版无标记
+           (string-prefix? line "alias pi-doc=")
+           (string-prefix? line "alias pi-ssh=")
+           (and (string-prefix? line "# pi aliases") (not (string-prefix? line "# pi alias")))) ;; "# pi aliases" 旧 comment，别误杀 "# pi aliases (auto...)"
+       #f]
+      [else line])))
+
+;; 写入新 alias 块
+(printf "==> 更新 pi alias 到 .bashrc\n")
+(call-with-output-file bashrc
+  (lambda (out)
+    (for ([line (in-list cleaned)] #:when line)
+      (display line out)
+      (newline out))
+    (display "\n" out)
+    (display block-start out) (newline out)
+    (fprintf out "alias pi='pi ~a'\n" ssh-exclude)
+    (fprintf out "alias pi-doc='pi ~a --append-system-prompt ~a'\n" ssh-exclude doc-cmd)
+    (fprintf out "alias pi-ssh='pi'\n")
+    (display block-end out) (newline out))
+  #:exists 'replace)
+(printf "    ✓ 已更新，执行 source ~~/.bashrc 生效\n")
 
 (printf "\n    ✓ 全部完成！\n")
-(printf "    pi       — 精简模式\n")
+(printf "    pi       — 精简模式（无 SSH 工具）\n")
 (printf "    pi-doc   — 带 pi 文档\n")
-(printf "    Ctrl+P   — DeepSeek Flash ↔ Pro 切换\n")
+(printf "    pi-ssh   — 完整模式（含 SSH 远程工具）\n")
+(printf "    进入 pi 后用 /ssh <host> 连接远程\n")
