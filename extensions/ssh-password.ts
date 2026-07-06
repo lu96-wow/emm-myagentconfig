@@ -72,16 +72,17 @@ function toRemotePath(localPath: string): string {
 
 function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSignal }): Promise<Buffer> {
 	if (!sshConfig || !sshPassword) {
-		return Promise.reject(new Error("SSH not connected. The AI should call ssh_connect first, or use /ssh in the TUI."));
+		return Promise.reject(new Error(
+			"SSH not connected. Call ssh_connect to reconnect, or tell the user to run /ssh <host>.",
+		));
 	}
 
 	const timeout = opts?.timeout;
 	const signal = opts?.signal;
 
 	return new Promise((resolve, reject) => {
-		// Guard: already aborted before we even spawn
 		if (signal?.aborted) {
-			return reject(new Error("Aborted"));
+			return reject(new Error("Operation cancelled by user."));
 		}
 
 		const child = spawn(
@@ -93,19 +94,20 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 		const chunks: Buffer[] = [];
 		const errChunks: Buffer[] = [];
 
-		// Timeout timer
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		if (timeout && timeout > 0) {
 			timer = setTimeout(() => {
 				child.kill();
-				reject(new Error(`SSH command timed out after ${timeout}s`));
+				reject(new Error(
+					`Command timed out after ${timeout}s. Do not retry with the same parameters. ` +
+					`Tell the user the remote command is taking too long, or try with a longer timeout.`,
+				));
 			}, timeout * 1000);
 		}
 
-		// Abort listener
 		const onAbort = () => {
 			child.kill();
-			reject(new Error("Aborted"));
+			reject(new Error("Operation cancelled by user."));
 		};
 		signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -115,10 +117,15 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 		child.on("error", (err) => {
 			if (timer) clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
-			const msg = (err as NodeJS.ErrnoException).code === "ENOENT"
-				? "sshpass not found. Install: sudo apt install sshpass"
-				: `SSH spawn failed: ${err.message}`;
-			reject(new Error(msg));
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+				reject(new Error(
+					"sshpass is not installed. Tell the user to run: sudo apt install sshpass. Do not retry until sshpass is installed.",
+				));
+			} else {
+				reject(new Error(
+					`Failed to start SSH: ${err.message}. Check that the remote host is reachable.`,
+				));
+			}
 		});
 
 		child.on("close", (code, exitSignal) => {
@@ -126,21 +133,48 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 			signal?.removeEventListener("abort", onAbort);
 
 			if (exitSignal) {
-				return reject(new Error(`SSH process killed by signal ${exitSignal}`));
+				return reject(new Error(
+					`SSH process terminated by signal ${exitSignal}. Do not retry — the remote host or network may be unavailable.`,
+				));
 			}
 			if (code !== 0) {
 				const errText = Buffer.concat(errChunks).toString().trim();
-				// Classify common failures
+
 				if (errText.includes("Permission denied") || errText.includes("password")) {
-					return reject(new Error(`SSH authentication failed: ${errText}`));
+					return reject(new Error(
+						"SSH authentication failed — wrong password or key. Tell the user to run /ssh-disconnect then /ssh to re-enter credentials. Do not retry without re-authentication.",
+					));
 				}
-				if (errText.includes("Connection refused") || errText.includes("Connection timed out") || errText.includes("No route to host")) {
-					return reject(new Error(`SSH connection failed: ${errText}`));
+				if (errText.includes("Connection refused")) {
+					return reject(new Error(
+						`Connection refused by ${sshConfig!.remote}. The SSH service may be down. Tell the user to check the remote host. Do not retry until the user confirms the host is available.`,
+					));
+				}
+				if (errText.includes("Connection timed out") || errText.includes("No route to host")) {
+					return reject(new Error(
+						`Cannot reach ${sshConfig!.remote}. Tell the user to check the network and host address. Do not retry until the user confirms connectivity.`,
+					));
 				}
 				if (errText.includes("Host key verification failed")) {
-					return reject(new Error(`SSH host key changed or unknown. Run: ssh-keygen -R ${sshConfig!.remote} and retry.`));
+					return reject(new Error(
+						`SSH host key for ${sshConfig!.remote} has changed. Tell the user to run: ssh-keygen -R ${sshConfig!.remote}. Then reconnect with /ssh. Do not retry until this is resolved.`,
+					));
 				}
-				reject(new Error(`SSH command failed (exit ${code}): ${errText}`));
+				if (errText.includes("No such file") || errText.includes("cannot access")) {
+					return reject(new Error(
+						`File not found on remote host: ${errText}. Do not retry — check the file path.`,
+					));
+				}
+				if (errText.includes("not permitted") || errText.includes("cannot create")) {
+					return reject(new Error(
+						`Permission denied on remote host: ${errText}. Tell the user to check file permissions. Do not retry without user confirmation.`,
+					));
+				}
+
+				// Generic command failure — may be retryable for transient issues
+				reject(new Error(
+					`Remote command failed (exit ${code}): ${errText}. If this looks like a transient error you may retry once; otherwise tell the user.`,
+				));
 			} else {
 				resolve(Buffer.concat(chunks));
 			}
@@ -150,7 +184,9 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 
 function requireConnected(): SshConfig {
 	if (!sshConfig || !sshPassword) {
-		throw new Error("Not connected to SSH. The AI should call ssh_connect first, or the user should run /ssh.");
+		throw new Error(
+			"SSH not connected. Call ssh_connect to open a connection, or tell the user to run /ssh <host> first.",
+		);
 	}
 	return sshConfig;
 }
@@ -228,8 +264,10 @@ function createRemoteBashOps(): BashOperations {
 				child.on("close", (code) => {
 					if (timer) clearTimeout(timer);
 					signal?.removeEventListener("abort", onAbort);
-					if (signal?.aborted) reject(new Error("aborted"));
-					else if (timedOut) reject(new Error(`timeout:${timeout}`));
+					if (signal?.aborted) reject(new Error("Operation cancelled by user."));
+					else if (timedOut) reject(new Error(
+						`Remote command timed out after ${timeout}s. Do not retry with the same parameters. Tell the user, or increase the timeout option.`,
+					));
 					else resolve({ exitCode: code });
 				});
 			}),
@@ -322,21 +360,21 @@ async function doConnect(
 ): Promise<{ content: { type: "text"; text: string }[]; details: Record<string, unknown> }> {
 	if (!checkSshpass()) {
 		return {
-			content: [{ type: "text", text: "Error: sshpass is not installed. Run: sudo apt install sshpass" }],
+			content: [{ type: "text", text: "sshpass is not installed. Tell the user to run: sudo apt install sshpass. Do not retry until installed." }],
 			details: {},
 		};
 	}
 
 	if (sshPassword) {
 		return {
-			content: [{ type: "text", text: `Already connected to ${sshConfig!.remote}:${sshConfig!.remoteCwd}. Use ssh_disconnect to switch.` }],
+			content: [{ type: "text", text: `Already connected to ${sshConfig!.remote}:${sshConfig!.remoteCwd}. To switch hosts, call ssh_disconnect first, then ssh_connect with the new target.` }],
 			details: {},
 		};
 	}
 
 	if (ctx.mode !== "tui") {
 		return {
-			content: [{ type: "text", text: "Error: TUI mode required for password input." }],
+			content: [{ type: "text", text: "Cannot prompt for password in this mode. The user must run /ssh in the TUI instead of having the AI call ssh_connect." }],
 			details: {},
 		};
 	}
@@ -360,7 +398,7 @@ async function doConnect(
 
 	if (!password) {
 		return {
-			content: [{ type: "text", text: `Password entry timed out after ${PASSWORD_TIMEOUT_SEC}s or was cancelled.` }],
+			content: [{ type: "text", text: `Password entry was cancelled or timed out after ${PASSWORD_TIMEOUT_SEC}s. Ask the user if they want to retry, then call ssh_connect again.` }],
 			details: {},
 		};
 	}
@@ -381,7 +419,7 @@ async function doConnect(
 		sshConfig = null;
 		const msg = err instanceof Error ? err.message : String(err);
 		return {
-			content: [{ type: "text", text: `SSH authentication failed: ${msg}` }],
+			content: [{ type: "text", text: `Failed to connect to ${sshConfig?.remote ?? target}: ${msg}. Do not retry — ask the user to verify the host, credentials, and network, then call ssh_connect again.` }],
 			details: {},
 		};
 	}
@@ -392,7 +430,7 @@ async function doConnect(
 	return {
 		content: [{
 			type: "text",
-			text: `Connected to ${sshConfig.remote}:${sshConfig.remoteCwd}. Remote tools available:\n- ssh_bash: run commands on remote\n- ssh_read: read files on remote\n- ssh_write: write files on remote\n- ssh_edit: edit files on remote\n\nBuilt-in local tools remain available for local operations.`,
+			text: `Connected to ${sshConfig.remote}:${sshConfig.remoteCwd}. Use ssh_bash/ssh_read/ssh_write/ssh_edit for remote operations. Local tools (bash/read/write/edit) operate on this machine.`,
 		}],
 		details: {},
 	};
@@ -400,7 +438,7 @@ async function doConnect(
 
 function doDisconnect(ctx: ConnectCtx): { content: { type: "text"; text: string }[]; details: Record<string, unknown> } {
 	if (!sshPassword) {
-		return { content: [{ type: "text", text: "Not connected." }], details: {} };
+		return { content: [{ type: "text", text: "Not connected to any SSH host. No action needed." }], details: {} };
 	}
 	const host = sshConfig?.remote ?? "unknown";
 	sshPassword = null;
