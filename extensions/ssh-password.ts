@@ -10,7 +10,7 @@
  *   /ssh user@host:/remote/path
  *
  * Requirements:
- *   - sshpass installed on local machine: sudo apt install sshpass
+ *   - sshpass installed on local machine (e.g., apt install sshpass, brew install sshpass, pkg install sshpass)
  *   - bash on remote machine
  *
  * How it works:
@@ -47,6 +47,23 @@ interface SshConfig {
 let sshConfig: SshConfig | null = null;
 let sshPassword: string | null = null;
 const localCwd = process.cwd();
+
+// ─── Connection state flag (in-memory only, never persisted) ─────────────
+// null = never connected | "connected" | "disconnected" (reconnectable) | "error" (user must intervene)
+type SshConnectionState = "connected" | "disconnected" | "error" | null;
+let sshConnectionState: SshConnectionState = null;
+
+/** Classify an error message: reconnectable (disconnected) or non-recoverable (error). */
+function classifyError(msg: string): "disconnected" | "error" {
+	const reconnectablePatterns = [
+		"Connection reset",
+		"Broken pipe",
+		"Connection closed",
+		"terminated by signal",
+		"timed out",
+	];
+	return reconnectablePatterns.some((p) => msg.includes(p)) ? "disconnected" : "error";
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -99,7 +116,7 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 			timer = setTimeout(() => {
 				child.kill();
 				reject(new Error(
-					`Command timed out after ${timeout}s. Do not retry with the same parameters. ` +
+					`Command timed out after ${timeout}s. The connection is still alive — call ssh_check_connect to confirm. ` +
 					`Tell the user the remote command is taking too long, or try with a longer timeout.`,
 				));
 			}, timeout * 1000);
@@ -119,11 +136,11 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 			signal?.removeEventListener("abort", onAbort);
 			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
 				reject(new Error(
-					"sshpass is not installed. Tell the user to run: sudo apt install sshpass. Do not retry until sshpass is installed.",
+					"sshpass is not installed. Tell the user to install sshpass using their system package manager. Do not retry until sshpass is installed.",
 				));
 			} else {
 				reject(new Error(
-					`Failed to start SSH: ${err.message}. Check that the remote host is reachable.`,
+					`Failed to start SSH: ${err.message}. Call ssh_check_connect to verify — the remote host may be unreachable.`,
 				));
 			}
 		});
@@ -134,7 +151,7 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 
 			if (exitSignal) {
 				return reject(new Error(
-					`SSH process terminated by signal ${exitSignal}. Do not retry — the remote host or network may be unavailable.`,
+					`SSH process terminated by signal ${exitSignal}. Call ssh_check_connect to verify connection status before deciding whether to retry.`,
 				));
 			}
 			if (code !== 0) {
@@ -142,22 +159,22 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 
 				if (errText.includes("Permission denied") || errText.includes("password")) {
 					return reject(new Error(
-						"SSH authentication failed — wrong password or key. Tell the user to run /ssh-disconnect then /ssh to re-enter credentials. Do not retry without re-authentication.",
+						"SSH authentication failed — wrong password or key. This is non-recoverable. Tell the user to run /ssh-disconnect then /ssh to re-enter credentials. Call ssh_check_connect to confirm status.",
 					));
 				}
 				if (errText.includes("Connection refused")) {
 					return reject(new Error(
-						`Connection refused by ${sshConfig!.remote}. The SSH service may be down. Tell the user to check the remote host. Do not retry until the user confirms the host is available.`,
+						`Connection refused by ${sshConfig!.remote}. Call ssh_check_connect to verify — this may be a transient network issue or the SSH service may be down.`,
 					));
 				}
 				if (errText.includes("Connection timed out") || errText.includes("No route to host")) {
 					return reject(new Error(
-						`Cannot reach ${sshConfig!.remote}. Tell the user to check the network and host address. Do not retry until the user confirms connectivity.`,
+						`Cannot reach ${sshConfig!.remote} (timeout / no route). Call ssh_check_connect to verify — this may be a transient network issue.`,
 					));
 				}
 				if (errText.includes("Host key verification failed")) {
 					return reject(new Error(
-						`SSH host key for ${sshConfig!.remote} has changed. Tell the user to run: ssh-keygen -R ${sshConfig!.remote}. Then reconnect with /ssh. Do not retry until this is resolved.`,
+						`SSH host key for ${sshConfig!.remote} has changed. This is a security issue — tell the user to run: ssh-keygen -R ${sshConfig!.remote}. Do not retry until resolved. Call ssh_check_connect to confirm status.`,
 					));
 				}
 				if (errText.includes("No such file") || errText.includes("cannot access")) {
@@ -171,14 +188,36 @@ function sshExec(command: string, opts?: { timeout?: number; signal?: AbortSigna
 					));
 				}
 
-				// Generic command failure — may be retryable for transient issues
+				// Generic command failure — connection may still be alive
 				reject(new Error(
-					`Remote command failed (exit ${code}): ${errText}. If this looks like a transient error you may retry once; otherwise tell the user.`,
+					`Remote command failed (exit ${code}): ${errText}. Call ssh_check_connect to verify the connection is still alive before retrying.`,
 				));
 			} else {
+				sshConnectionState = "connected";
 				resolve(Buffer.concat(chunks));
 			}
 		});
+	});
+}
+
+/** Tracked wrapper: updates sshConnectionState after every call. */
+function sshExecTracked(command: string, opts?: { timeout?: number; signal?: AbortSignal }): Promise<Buffer> {
+	return sshExec(command, opts).catch((err) => {
+		const msg = err instanceof Error ? err.message : String(err);
+		// "SSH not connected" means no credentials at all — reset to null
+		if (msg.startsWith("SSH not connected")) {
+			sshConnectionState = null;
+		} else if (msg.startsWith("Command timed out")) {
+			// Local timeout: the connection is alive, just the remote command was slow
+			sshConnectionState = "connected";
+		} else if (msg.startsWith("File not found") || msg.startsWith("Permission denied on remote") || msg.startsWith("Remote command failed") || msg.startsWith("Operation cancelled")) {
+			// Command-level errors or user cancellation: the SSH connection itself is alive
+			sshConnectionState = "connected";
+		} else {
+			// Connection/auth-level errors: classify as disconnected or error
+			sshConnectionState = classifyError(msg);
+		}
+		throw err;
 	});
 }
 
@@ -197,11 +236,11 @@ function createRemoteReadOps(): ReadOperations {
 	return {
 		readFile: (p: string) => {
 			const remote = toRemotePath(p);
-			return sshExec(`cat ${JSON.stringify(remote)}`);
+			return sshExecTracked(`cat ${JSON.stringify(remote)}`);
 		},
 		access: (p: string) => {
 			const remote = toRemotePath(p);
-			return sshExec(`test -r ${JSON.stringify(remote)}`).then(
+			return sshExecTracked(`test -r ${JSON.stringify(remote)}`).then(
 				() => {},
 				() => { throw new Error(`File not accessible on remote: ${p}`); },
 			);
@@ -209,7 +248,7 @@ function createRemoteReadOps(): ReadOperations {
 		detectImageMimeType: async (p: string) => {
 			try {
 				const remote = toRemotePath(p);
-				const r = await sshExec(`file --mime-type -b ${JSON.stringify(remote)}`);
+				const r = await sshExecTracked(`file --mime-type -b ${JSON.stringify(remote)}`);
 				const m = r.toString().trim();
 				return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(m) ? m : null;
 			} catch {
@@ -224,11 +263,11 @@ function createRemoteWriteOps(): WriteOperations {
 		writeFile: async (p: string, content: Buffer) => {
 			const remote = toRemotePath(p);
 			const b64 = Buffer.from(content).toString("base64");
-			await sshExec(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(remote)}`);
+			await sshExecTracked(`echo ${JSON.stringify(b64)} | base64 -d > ${JSON.stringify(remote)}`);
 		},
 		mkdir: (dir: string) => {
 			const remote = toRemotePath(dir);
-			return sshExec(`mkdir -p ${JSON.stringify(remote)}`).then(() => {});
+			return sshExecTracked(`mkdir -p ${JSON.stringify(remote)}`).then(() => {});
 		},
 	};
 }
@@ -265,10 +304,15 @@ function createRemoteBashOps(): BashOperations {
 					if (timer) clearTimeout(timer);
 					signal?.removeEventListener("abort", onAbort);
 					if (signal?.aborted) reject(new Error("Operation cancelled by user."));
-					else if (timedOut) reject(new Error(
-						`Remote command timed out after ${timeout}s. Do not retry with the same parameters. Tell the user, or increase the timeout option.`,
-					));
-					else resolve({ exitCode: code });
+					else if (timedOut) {
+						sshConnectionState = "disconnected";
+						reject(new Error(
+							`Remote command timed out after ${timeout}s. Do not retry with the same parameters. Tell the user, or increase the timeout option.`,
+						));
+					} else {
+						if (code === 0) sshConnectionState = "connected";
+						resolve({ exitCode: code });
+					}
 				});
 			}),
 	};
@@ -360,7 +404,7 @@ async function doConnect(
 ): Promise<{ content: { type: "text"; text: string }[]; details: Record<string, unknown> }> {
 	if (!checkSshpass()) {
 		return {
-			content: [{ type: "text", text: "sshpass is not installed. Tell the user to run: sudo apt install sshpass. Do not retry until installed." }],
+			content: [{ type: "text", text: "sshpass is not installed. Tell the user to install sshpass using their system package manager. Do not retry until installed." }],
 			details: {},
 		};
 	}
@@ -426,6 +470,7 @@ async function doConnect(
 
 	ctx.ui.setStatus("ssh", ctx.ui.theme.fg("success", `SSH: ${sshConfig.remote}:${sshConfig.remoteCwd}`));
 	ctx.ui.notify(`Connected to ${sshConfig.remote}:${sshConfig.remoteCwd}`, "info");
+	sshConnectionState = "connected";
 
 	return {
 		content: [{
@@ -443,6 +488,7 @@ function doDisconnect(ctx: ConnectCtx): { content: { type: "text"; text: string 
 	const host = sshConfig?.remote ?? "unknown";
 	sshPassword = null;
 	sshConfig = null;
+	sshConnectionState = null;
 	ctx.ui.setStatus("ssh", undefined);
 	ctx.ui.notify(`Disconnected from ${host}`, "info");
 	return { content: [{ type: "text", text: `Disconnected from ${host}.` }], details: {} };
@@ -502,6 +548,51 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			return doDisconnect(ctx);
+		},
+	});
+
+	// ── ssh_check_connect tool ─────────────────────────────────────────────
+	pi.registerTool({
+		name: "ssh_check_connect",
+		label: "SSH Check Connect",
+		description:
+			"Check whether the SSH connection is alive. Reads an in-memory state flag that is updated by every SSH operation. " +
+			"Returns one of: (1) not_connected — never connected, call ssh_connect; " +
+			"(2) connected — connection is alive, proceed; " +
+			"(3) disconnected — session existed but was dropped (reconnectable), call ssh_connect; " +
+			"(4) error — non-recoverable failure, user must intervene, do NOT retry.",
+		promptSnippet: "Check if the SSH connection is alive (ssh_check_connect)",
+		promptGuidelines: [
+			"If any SSH tool (ssh_bash/ssh_read/ssh_write/ssh_edit) fails, immediately call ssh_check_connect to determine the connection status.",
+			"If status is 'not_connected' or 'disconnected': you may call ssh_connect to (re-)establish the session.",
+			"If status is 'error': STOP. Tell the user what went wrong and wait for their intervention. Do NOT retry any SSH tool.",
+			"If status is 'connected': the remote command simply failed, not the connection itself.",
+		],
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, _ctx) {
+			if (sshConnectionState === null) {
+				return {
+					content: [{ type: "text", text: "SSH status: not_connected — No SSH session has been established. Call ssh_connect to connect." }],
+					details: { status: "not_connected", remote: null, reconnectable: true },
+				};
+			}
+			if (sshConnectionState === "connected") {
+				return {
+					content: [{ type: "text", text: `SSH status: connected — Connection to ${sshConfig!.remote}:${sshConfig!.remoteCwd} is alive.` }],
+					details: { status: "connected", remote: `${sshConfig!.remote}:${sshConfig!.remoteCwd}`, reconnectable: false },
+				};
+			}
+			if (sshConnectionState === "disconnected") {
+				return {
+					content: [{ type: "text", text: `SSH status: disconnected — The session to ${sshConfig!.remote} was dropped. Call ssh_connect to reconnect (credentials are still in memory).` }],
+					details: { status: "disconnected", remote: sshConfig!.remote, reconnectable: true },
+				};
+			}
+			// sshConnectionState === "error"
+			return {
+				content: [{ type: "text", text: `SSH status: error — Connection to ${sshConfig!.remote} encountered a non-recoverable failure. Do NOT retry any SSH tool. Tell the user and wait for their intervention.` }],
+				details: { status: "error", remote: sshConfig!.remote, reconnectable: false },
+			};
 		},
 	});
 
@@ -625,7 +716,8 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"## SSH Remote Connection",
 			`Connected to ${sshConfig.remote}, working directory ${sshConfig.remoteCwd}.`,
-			"Remote tools: ssh_bash, ssh_read, ssh_write, ssh_edit.",
+			"Remote tools: ssh_bash, ssh_read, ssh_write, ssh_edit, ssh_check_connect.",
+			"If any SSH tool fails, immediately call ssh_check_connect to check whether the connection is still alive.",
 			"Local tools (bash, read, write, edit) remain available for local operations.",
 		].join("\n");
 

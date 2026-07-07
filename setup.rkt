@@ -55,7 +55,7 @@
 (define bashrc (build-path (find-system-path 'home-dir) ".bashrc"))
 (define block-start "# >>> pi aliases (auto-generated, do not edit below) >>>")
 (define block-end   "# <<< pi aliases end <<<")
-(define ssh-exclude "--exclude-tools ssh_bash,ssh_read,ssh_write,ssh_edit,ssh_connect,ssh_disconnect")
+(define ssh-exclude "--exclude-tools ssh_bash,ssh_read,ssh_write,ssh_edit,ssh_connect,ssh_disconnect,ssh_check_connect")
 (define doc-cmd "\"$(cat ~/.pi/agent/PI_DOCS.md)\"")
 
 ;; 先移除旧的 pi alias 块（新版和旧版 marker 都处理）
